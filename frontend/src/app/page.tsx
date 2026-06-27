@@ -81,9 +81,43 @@ export default function Home() {
   const [result, setResult] = useState<PredictionResult | null>(null);
   const [errorMsg, setErrorMsg] = useState("");
   const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [logsLoading, setLogsLoading] = useState(false);
   const [darkMode, setDarkMode] = useState(false);
   const [rdkitInstance, setRdkitInstance] = useState<any>(null);
   const [rdkitStatus, setRdkitStatus] = useState("Loading chemistry module...");
+
+  // Fetch prediction logs from API or localStorage fallback
+  const fetchLogs = async () => {
+    setLogsLoading(true);
+    const apiUrl = process.env.NEXT_PUBLIC_API_URL || "";
+    try {
+      const response = await fetch(`${apiUrl.replace(/\/$/, "")}/api/logs`);
+      if (response.ok) {
+        const data = await response.json();
+        setLogs(data);
+        setLogsLoading(false);
+        return;
+      }
+    } catch (err) {
+      console.warn("Failed to fetch logs from backend, falling back to local storage logs.", err);
+    }
+
+    const savedLogs = localStorage.getItem("ic50_forge_logs");
+    if (savedLogs) {
+      try {
+        setLogs(JSON.parse(savedLogs));
+      } catch (e) {
+        console.error("Failed to parse local logs:", e);
+      }
+    }
+    setLogsLoading(false);
+  };
+
+  useEffect(() => {
+    if (activeTab === "dashboard") {
+      fetchLogs();
+    }
+  }, [activeTab]);
 
   // Initialize and check dark mode
   useEffect(() => {
@@ -98,7 +132,7 @@ export default function Home() {
       document.documentElement.classList.remove("dark");
     }
 
-    // Load logs from localStorage
+    // Load logs initially
     const savedLogs = localStorage.getItem("ic50_forge_logs");
     if (savedLogs) {
       try {
@@ -216,30 +250,72 @@ export default function Home() {
       return;
     }
 
-    if (!rdkitInstance) {
-      setErrorMsg("The chemical WebAssembly module is still loading. Please wait.");
-      return;
-    }
-
     setIsLoading(true);
     setErrorMsg("");
     setResult(null);
 
-    // Run prediction client-side in a small timeout to let loading state show
+    const smiles = smilesInput.trim();
+    const apiUrl = process.env.NEXT_PUBLIC_API_URL || "";
+
+    // Try Python Backend first (local or remote)
+    try {
+      const response = await fetch(`${apiUrl.replace(/\/$/, "")}/api/predict`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ smiles }),
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        setResult({
+          smiles: data.smiles,
+          pIC50: data.pIC50,
+          ic50_um: data.ic50_um,
+          fingerprint: data.fingerprint,
+        });
+
+        // Log locally for Dashboard consistency
+        const newLogEntry: LogEntry = {
+          id: Date.now(),
+          smiles: smiles,
+          pic50_pred: data.pIC50,
+          ic50_um_pred: data.ic50_um,
+          timestamp: new Date().toISOString().replace("T", " ").substring(0, 19),
+        };
+        const updatedLogs = [newLogEntry, ...logs];
+        setLogs(updatedLogs);
+        localStorage.setItem("ic50_forge_logs", JSON.stringify(updatedLogs));
+        setIsLoading(false);
+        return;
+      } else {
+        const data = await response.json();
+        console.warn("Backend error:", data.detail || "Unknown error. Falling back to client-side...");
+      }
+    } catch (err) {
+      console.warn("Backend connection failed, falling back to client-side WASM...", err);
+    }
+
+    // Client-side Fallback (WASM RDKit + JS weights)
+    if (!rdkitInstance) {
+      setErrorMsg("Chemistry WebAssembly module is loading. Please wait or check your SMILES string.");
+      setIsLoading(false);
+      return;
+    }
+
     setTimeout(() => {
       let mol = null;
       try {
-        const smiles = smilesInput.trim();
         mol = rdkitInstance.get_mol(smiles);
-        
         if (!mol) {
           setErrorMsg("Invalid SMILES string. RDKit failed to parse the molecule.");
           setIsLoading(false);
           return;
         }
 
-        // Generate 1024-bit Morgan Fingerprint radius 2
-        const fpBinaryText = mol.get_morgan_fp_as_binary_text(2, 1024) as string;
+        const fpOptions = JSON.stringify({ radius: 2, nBits: 1024 });
+        const fpBinaryText = mol.get_morgan_fp(fpOptions) as string;
 
         if (!fpBinaryText || fpBinaryText.length !== 1024) {
           setErrorMsg("Failed to generate molecular fingerprint descriptor.");
@@ -247,25 +323,17 @@ export default function Home() {
           return;
         }
 
-        // Convert bit string to number array
         const fpArray = Array.from(fpBinaryText).map((char: string) => parseInt(char, 10));
-
-        // Predict pIC50 using pre-trained weights
         const pic50Pred = runNeuralNetwork(fpArray);
-        
-        // Convert pIC50 back to micromolar: 10^(6 - pIC50)
         const ic50UmPred = Math.pow(10, 6 - pic50Pred);
 
-        const predictionData: PredictionResult = {
+        setResult({
           smiles,
           pIC50: pic50Pred,
           ic50_um: ic50UmPred,
           fingerprint: fpArray,
-        };
+        });
 
-        setResult(predictionData);
-
-        // Log prediction to LocalStorage database logs
         const newLogEntry: LogEntry = {
           id: Date.now(),
           smiles: smiles,
@@ -273,7 +341,6 @@ export default function Home() {
           ic50_um_pred: ic50UmPred,
           timestamp: new Date().toISOString().replace("T", " ").substring(0, 19),
         };
-
         const updatedLogs = [newLogEntry, ...logs];
         setLogs(updatedLogs);
         localStorage.setItem("ic50_forge_logs", JSON.stringify(updatedLogs));
