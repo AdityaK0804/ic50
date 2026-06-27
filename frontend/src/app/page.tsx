@@ -239,8 +239,7 @@ export default function Home() {
         }
 
         // Generate 1024-bit Morgan Fingerprint radius 2
-        const fpJsonOptions = JSON.stringify({ radius: 2, len: 1024 });
-        const fpBinaryText = mol.get_morgan_fp_as_binary_text(fpJsonOptions) as string;
+        const fpBinaryText = mol.get_morgan_fp_as_binary_text(2, 1024) as string;
 
         if (!fpBinaryText || fpBinaryText.length !== 1024) {
           setErrorMsg("Failed to generate molecular fingerprint descriptor.");
