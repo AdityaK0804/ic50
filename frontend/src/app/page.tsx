@@ -20,13 +20,33 @@ import {
   ExternalLink,
 } from "lucide-react";
 
+// Import pre-trained model weights exported from Keras
+import modelWeightsRaw from "./model_weights.json";
+
+// Type assertions for weights
+const modelWeights = modelWeightsRaw as {
+  dense_0_kernel: number[][];
+  dense_0_bias: number[];
+  bn_1_scale: number[];
+  bn_1_offset: number[];
+  dense_3_kernel: number[][];
+  dense_3_bias: number[];
+  dense_4_kernel: number[][];
+  dense_4_bias: number[];
+};
+
+declare global {
+  interface Window {
+    initRDKitModule?: () => Promise<any>;
+  }
+}
+
 // Types for Prediction
 interface PredictionResult {
   smiles: string;
   pIC50: number;
   ic50_um: number;
   fingerprint: number[];
-  error?: string;
 }
 
 // Types for History Logs
@@ -61,8 +81,9 @@ export default function Home() {
   const [result, setResult] = useState<PredictionResult | null>(null);
   const [errorMsg, setErrorMsg] = useState("");
   const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [logsLoading, setLogsLoading] = useState(false);
   const [darkMode, setDarkMode] = useState(false);
+  const [rdkitInstance, setRdkitInstance] = useState<any>(null);
+  const [rdkitStatus, setRdkitStatus] = useState("Loading chemistry module...");
 
   // Initialize and check dark mode
   useEffect(() => {
@@ -76,6 +97,55 @@ export default function Home() {
     } else {
       document.documentElement.classList.remove("dark");
     }
+
+    // Load logs from localStorage
+    const savedLogs = localStorage.getItem("ic50_forge_logs");
+    if (savedLogs) {
+      try {
+        setLogs(JSON.parse(savedLogs));
+      } catch (e) {
+        console.error("Failed to load local logs:", e);
+      }
+    }
+  }, []);
+
+  // Load RDKit WebAssembly via CDN dynamically
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    
+    // Check if script is already added
+    const existingScript = document.getElementById("rdkit-wasm-script");
+    if (existingScript) {
+      if ((window as any).rdkit) {
+        setRdkitInstance((window as any).rdkit);
+        setRdkitStatus("Chemistry module ready");
+      }
+      return;
+    }
+
+    const script = document.createElement("script");
+    script.id = "rdkit-wasm-script";
+    script.src = "https://unpkg.com/@rdkit/rdkit/dist/RDKit_minimal.js";
+    script.async = true;
+    script.onload = () => {
+      if (window.initRDKitModule) {
+        window.initRDKitModule()
+          .then((module: any) => {
+            console.log("RDKit WASM loaded successfully!");
+            (window as any).rdkit = module;
+            setRdkitInstance(module);
+            setRdkitStatus("Chemistry module ready");
+          })
+          .catch((err: any) => {
+            console.error("Failed to initialize RDKit WASM:", err);
+            setRdkitStatus("Failed to load chemistry module");
+          });
+      }
+    };
+    script.onerror = () => {
+      setRdkitStatus("Failed to download chemistry module script");
+    };
+    document.body.appendChild(script);
   }, []);
 
   const toggleDarkMode = () => {
@@ -90,27 +160,54 @@ export default function Home() {
     }
   };
 
-  // Fetch prediction logs
-  const fetchLogs = async () => {
-    setLogsLoading(true);
-    try {
-      const response = await fetch("/api/logs");
-      if (response.ok) {
-        const data = await response.json();
-        setLogs(data);
-      }
-    } catch (err) {
-      console.error("Failed to fetch logs:", err);
-    } finally {
-      setLogsLoading(false);
-    }
-  };
+  // Model Inference Forward Pass in JavaScript
+  const runNeuralNetwork = (fp: number[]): number => {
+    // Layer 0: Dense (1024 -> 256)
+    const w0 = modelWeights.dense_0_kernel;
+    const b0 = modelWeights.dense_0_bias;
+    const scale = modelWeights.bn_1_scale;
+    const offset = modelWeights.bn_1_offset;
 
-  useEffect(() => {
-    if (activeTab === "dashboard") {
-      fetchLogs();
+    const z0 = new Array(256).fill(0);
+    for (let j = 0; j < 256; j++) {
+      let sum = 0;
+      for (let i = 0; i < 1024; i++) {
+        sum += fp[i] * w0[i][j];
+      }
+      z0[j] = sum + b0[j];
     }
-  }, [activeTab]);
+
+    // Layer 1: ReLU + Batch Normalization
+    const a0 = new Array(256).fill(0);
+    for (let j = 0; j < 256; j++) {
+      const relu = Math.max(0, z0[j]);
+      a0[j] = relu * scale[j] + offset[j];
+    }
+
+    // Layer 3: Dense (256 -> 64)
+    const w3 = modelWeights.dense_3_kernel;
+    const b3 = modelWeights.dense_3_bias;
+    const z3 = new Array(64).fill(0);
+    for (let j = 0; j < 64; j++) {
+      let sum = 0;
+      for (let i = 0; i < 256; i++) {
+        sum += a0[i] * w3[i][j];
+      }
+      z3[j] = sum + b3[j];
+    }
+
+    // Activation: ReLU
+    const a3 = z3.map((val) => Math.max(0, val));
+
+    // Layer 4: Dense (64 -> 1, Linear)
+    const w4 = modelWeights.dense_4_kernel;
+    const b4 = modelWeights.dense_4_bias;
+    let y = 0;
+    for (let i = 0; i < 64; i++) {
+      y += a3[i] * w4[i][0];
+    }
+    return y + b4[0];
+  };
 
   const handlePredict = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -119,32 +216,76 @@ export default function Home() {
       return;
     }
 
+    if (!rdkitInstance) {
+      setErrorMsg("The chemical WebAssembly module is still loading. Please wait.");
+      return;
+    }
+
     setIsLoading(true);
     setErrorMsg("");
     setResult(null);
 
-    try {
-      const response = await fetch("/api/predict", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ smiles: smilesInput }),
-      });
+    // Run prediction client-side in a small timeout to let loading state show
+    setTimeout(() => {
+      let mol = null;
+      try {
+        const smiles = smilesInput.trim();
+        mol = rdkitInstance.get_mol(smiles);
+        
+        if (!mol) {
+          setErrorMsg("Invalid SMILES string. RDKit failed to parse the molecule.");
+          setIsLoading(false);
+          return;
+        }
 
-      const data = await response.json();
+        // Generate 1024-bit Morgan Fingerprint radius 2
+        const fpJsonOptions = JSON.stringify({ radius: 2, len: 1024 });
+        const fpBinaryText = mol.get_morgan_fp_as_binary_text(fpJsonOptions) as string;
 
-      if (response.ok) {
-        setResult(data);
-      } else {
-        setErrorMsg(data.detail || "Prediction failed. Ensure SMILES is valid.");
+        if (!fpBinaryText || fpBinaryText.length !== 1024) {
+          setErrorMsg("Failed to generate molecular fingerprint descriptor.");
+          setIsLoading(false);
+          return;
+        }
+
+        // Convert bit string to number array
+        const fpArray = Array.from(fpBinaryText).map((char: string) => parseInt(char, 10));
+
+        // Predict pIC50 using pre-trained weights
+        const pic50Pred = runNeuralNetwork(fpArray);
+        
+        // Convert pIC50 back to micromolar: 10^(6 - pIC50)
+        const ic50UmPred = Math.pow(10, 6 - pic50Pred);
+
+        const predictionData: PredictionResult = {
+          smiles,
+          pIC50: pic50Pred,
+          ic50_um: ic50UmPred,
+          fingerprint: fpArray,
+        };
+
+        setResult(predictionData);
+
+        // Log prediction to LocalStorage database logs
+        const newLogEntry: LogEntry = {
+          id: Date.now(),
+          smiles: smiles,
+          pic50_pred: pic50Pred,
+          ic50_um_pred: ic50UmPred,
+          timestamp: new Date().toISOString().replace("T", " ").substring(0, 19),
+        };
+
+        const updatedLogs = [newLogEntry, ...logs];
+        setLogs(updatedLogs);
+        localStorage.setItem("ic50_forge_logs", JSON.stringify(updatedLogs));
+
+      } catch (err) {
+        setErrorMsg("An error occurred during client-side chemical calculation.");
+        console.error(err);
+      } finally {
+        setIsLoading(false);
       }
-    } catch (err) {
-      setErrorMsg("Network error. Make sure the FastAPI server is running.");
-      console.error(err);
-    } finally {
-      setIsLoading(false);
-    }
+    }, 50);
   };
 
   const handlePresetClick = (smiles: string) => {
@@ -152,7 +293,6 @@ export default function Home() {
     setErrorMsg("");
   };
 
-  // Fix scroll logic: Switch tab to predict first, then scroll smoothly to anchor element
   const handleNavClick = (e: React.MouseEvent, anchorId: string) => {
     e.preventDefault();
     setActiveTab("predict");
@@ -162,6 +302,13 @@ export default function Home() {
         element.scrollIntoView({ behavior: "smooth" });
       }
     }, 100);
+  };
+
+  const clearLogs = () => {
+    if (confirm("Are you sure you want to clear your prediction history?")) {
+      setLogs([]);
+      localStorage.removeItem("ic50_forge_logs");
+    }
   };
 
   const getPotencyBadge = (pic50: number) => {
@@ -248,6 +395,15 @@ export default function Home() {
       </nav>
 
       <main className="flex-grow max-w-6xl mx-auto w-full px-6 py-12">
+        
+        {/* Connection status indicator for WebAssembly module */}
+        <div className="flex justify-end mb-4">
+          <span className="flex items-center space-x-2 text-xs font-mono text-gray-400">
+            <span className={`w-2 h-2 rounded-full ${rdkitInstance ? "bg-emerald-500" : "bg-amber-500 animate-pulse"}`} />
+            <span>{rdkitStatus}</span>
+          </span>
+        </div>
+
         <AnimatePresence mode="wait">
           {activeTab === "predict" ? (
             <motion.div
@@ -267,7 +423,7 @@ export default function Home() {
                   className="space-y-4 mb-10"
                 >
                   <span className="px-3.5 py-1.5 rounded-full text-xs font-semibold bg-emerald-500/10 dark:bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20 tracking-wide uppercase">
-                    AI-Driven Potency Prediction
+                    Edge computing — 100% on Vercel
                   </span>
                   <h1 className="text-4xl md:text-5xl font-extrabold tracking-tight leading-tight">
                     Predict Chagas Disease <br />
@@ -276,7 +432,7 @@ export default function Home() {
                     </span>
                   </h1>
                   <p className="text-lg text-gray-600 dark:text-gray-400 max-w-2xl">
-                    Enter a molecular SMILES representation. Our Keras neural network converts the compound to a 1024-bit Morgan Fingerprint and computes its \(pIC_{50}\) value.
+                    Enter a molecular SMILES representation. Our WebAssembly chemistry pipeline and JavaScript neural network compute the compound's \(pIC_{50}\) instantly in your browser.
                   </p>
                 </motion.div>
 
@@ -441,7 +597,7 @@ export default function Home() {
                     Platform Features
                   </h2>
                   <p className="text-gray-500 dark:text-gray-400 text-sm">
-                    Highly optimized descriptors integrated with deep neural networks for state-of-the-art predictions.
+                    Highly optimized chemical descriptors integrated with neural networks for state-of-the-art client-side predictions.
                   </p>
                 </div>
 
@@ -449,21 +605,21 @@ export default function Home() {
                   {[
                     {
                       icon: <Layers className="w-6 h-6 text-emerald-500 dark:text-emerald-400" />,
-                      title: "1024-bit Fingerprints",
+                      title: "WebAssembly RDKit",
                       description:
-                        "Generates Morgan molecular fingerprints (radius 2) via RDKit to capture structural molecular subgraphs.",
+                        "Loads chemical calculations directly in the browser using the official RDKit WebAssembly module, generating identical 1024-bit Morgan fingerprints.",
                     },
                     {
                       icon: <Cpu className="w-6 h-6 text-emerald-500 dark:text-emerald-400" />,
-                      title: "Deep Neural Network",
+                      title: "Feedforward NN",
                       description:
-                        "Trained on Trypanosoma cruzi active screening bioassays using Keras sequential regression layers.",
+                        "Runs predictions in less than 1ms using JavaScript matrix calculations powered by pre-compiled weights and biases exported from our Keras model.",
                     },
                     {
                       icon: <Database className="w-6 h-6 text-emerald-500 dark:text-emerald-400" />,
-                      title: "SQLite Prediction Log",
+                      title: "Persistent Local Logs",
                       description:
-                        "Every successful inference is archived in a local SQLite datastore for review, diagnostics, and dashboarding.",
+                        "Predictions are securely written to the browser's local storage database, maintaining your history between restarts without database outages.",
                     },
                   ].map((feat, index) => (
                     <motion.div
@@ -510,13 +666,13 @@ export default function Home() {
                     },
                     {
                       step: "02",
-                      title: "RDKit Descriptor",
-                      desc: "Computes 1024-bit Morgan Fingerprint vector representing atom neighbor subgraphs.",
+                      title: "WASM Descriptor",
+                      desc: "RDKit compiles the chemical graph in WebAssembly, outputting a 1024-bit Morgan Fingerprint.",
                     },
                     {
                       step: "03",
-                      title: "Neural Network",
-                      desc: "Runs fingerprint array through the saved Sequential Keras neural network model.",
+                      title: "JS Inference",
+                      desc: "Calculates the neural network forward pass dynamically inside the page component context.",
                     },
                     {
                       step: "04",
@@ -559,36 +715,31 @@ export default function Home() {
                     Prediction Logs Dashboard
                   </h1>
                   <p className="text-sm text-gray-500 dark:text-gray-400">
-                    A secure repository logs all successful drug predictions written in the SQLite storage.
+                    A secure repository logging all successful drug predictions written in the local storage database.
                   </p>
                 </div>
-                <motion.button
-                  whileHover={{ scale: 1.02 }}
-                  whileTap={{ scale: 0.98 }}
-                  onClick={fetchLogs}
-                  disabled={logsLoading}
-                  className="px-4 py-2.5 rounded-full text-xs font-semibold bg-white dark:bg-zinc-900 hover:bg-gray-50 dark:hover:bg-zinc-800 text-gray-800 dark:text-gray-200 border border-gray-200 dark:border-zinc-800 shadow-sm flex items-center space-x-1.5 transition-colors cursor-pointer"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${logsLoading ? "animate-spin" : ""}`} />
-                  <span>Refresh Logs</span>
-                </motion.button>
+                <div className="flex items-center space-x-2">
+                  <motion.button
+                    whileHover={{ scale: 1.02 }}
+                    whileTap={{ scale: 0.98 }}
+                    onClick={clearLogs}
+                    className="px-4 py-2.5 rounded-full text-xs font-semibold bg-rose-500/10 hover:bg-rose-500/20 text-rose-600 border border-rose-500/20 shadow-sm flex items-center space-x-1.5 transition-colors cursor-pointer"
+                  >
+                    <span>Clear Logs</span>
+                  </motion.button>
+                </div>
               </div>
 
               {/* logs display */}
               <div className="bg-white dark:bg-zinc-900/40 rounded-3xl border border-gray-200 dark:border-zinc-800 overflow-hidden shadow-sm">
-                {logsLoading && logs.length === 0 ? (
-                  <div className="py-20 text-center space-y-4">
-                    <RefreshCw className="w-8 h-8 text-emerald-500 animate-spin mx-auto" />
-                    <p className="text-sm text-gray-500">Retrieving logs from database...</p>
-                  </div>
-                ) : logs.length === 0 ? (
+                {logs.length === 0 ? (
                   <div className="py-20 text-center space-y-3">
                     <div className="w-12 h-12 rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center mx-auto text-emerald-500">
                       <Database className="w-6 h-6" />
                     </div>
                     <p className="font-semibold text-base">No Predictions Logged Yet</p>
                     <p className="text-gray-500 text-sm max-w-sm mx-auto">
-                      Submit chemical SMILES strings on the Predictor tab to start logging records in the audit database.
+                      Submit chemical SMILES strings on the Predictor tab to start logging records.
                     </p>
                     <button
                       onClick={(e) => handleNavClick(e, "hero")}
@@ -611,9 +762,9 @@ export default function Home() {
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-gray-100 dark:divide-zinc-800/80 text-sm">
-                        {logs.map((log) => (
+                        {logs.map((log, idx) => (
                           <tr key={log.id} className="hover:bg-gray-50/50 dark:hover:bg-zinc-800/20 transition-colors">
-                            <td className="py-4 px-6 font-mono text-gray-400">#{log.id}</td>
+                            <td className="py-4 px-6 font-mono text-gray-400">#{logs.length - idx}</td>
                             <td className="py-4 px-6">
                               <div className="max-w-[400px] md:max-w-[500px] truncate font-mono text-xs text-gray-700 dark:text-gray-300 select-all" title={log.smiles}>
                                 {log.smiles}
@@ -643,12 +794,12 @@ export default function Home() {
       {/* Footer */}
       <footer className="border-t border-gray-200/50 dark:border-zinc-800/80 bg-white dark:bg-zinc-950 py-8 mt-12 text-center text-xs text-gray-500 space-y-2 transition-colors">
         <div>
-          <strong>IC50 FORGE</strong> — AI-driven Chagas disease drug potency predictor.
+          <strong>IC50 FORGE</strong> — Client-side AI-driven Chagas disease drug potency predictor.
         </div>
         <div className="flex justify-center space-x-6">
-          <span>Model: Keras Sequential (DNN)</span>
-          <span>Descriptor: 1024-bit Morgan FP</span>
-          <span>Database: SQLite3</span>
+          <span>Model: Keras Sequential (DNN) in JS</span>
+          <span>Descriptor: 1024-bit Morgan FP in WASM</span>
+          <span>Database: HTML5 LocalStorage</span>
         </div>
       </footer>
     </div>
